@@ -55,12 +55,48 @@ public class SystemProperties {
     public final static String PROPERTY_LISTEN_PORT = "peer.listen.port";
     public final static String PROPERTY_PEER_ACTIVE = "peer.active";
     public final static String PROPERTY_DB_RESET = "database.reset";
+    public final static String PROPERTY_PEER_DISCOVERY_ENABLED = "peer.discovery.enabled";
 
     /* Testing */
     private final static Boolean DEFAULT_VMTEST_LOAD_LOCAL = false;
     private final static String DEFAULT_BLOCKS_LOADER = "";
 
-    public final static SystemProperties CONFIG = new SystemProperties();
+    private static SystemProperties CONFIG;
+    private static boolean useOnlySpringConfig = false;
+    private String generatedNodePrivateKey;
+
+    /**
+     * Returns the static config instance. If the config is passed
+     * as a Spring bean by the application this instance shouldn't
+     * be used
+     * This method is mainly used for testing purposes
+     * (Autowired fields are initialized with this static instance
+     * but when running within Spring context they replaced with the
+     * bean config instance)
+     */
+    public static SystemProperties getDefault() {
+        return useOnlySpringConfig ? null : getSpringDefault();
+    }
+
+    static SystemProperties getSpringDefault() {
+        if (CONFIG == null) {
+            CONFIG = new SystemProperties();
+        }
+        return CONFIG;
+    }
+
+    /**
+     * Used mostly for testing purposes to ensure the application
+     * refers only to the config passed as a Spring bean.
+     * If this property is set to true {@link #getDefault()} returns null
+     */
+    public static void setUseOnlySpringConfig(boolean useOnlySpringConfig) {
+        SystemProperties.useOnlySpringConfig = useOnlySpringConfig;
+    }
+
+    static boolean isUseOnlySpringConfig() {
+        return useOnlySpringConfig;
+    }
 
     /**
      * Marks config accessor methods which need to be called (for value validation)
@@ -193,7 +229,7 @@ public class SystemProperties {
      *
      * @param cliOptions -  command line options to take presidency
      */
-    public void overrideParams(Map<String, String> cliOptions) {
+    public void overrideParams(Map<String, ? extends Object> cliOptions) {
         Config cliConf = ConfigFactory.parseMap(cliOptions);
         overrideParams(cliConf);
     }
@@ -552,24 +588,31 @@ public class SystemProperties {
     }
 
     private String getGeneratedNodePrivateKey() {
-        try {
-            File file = new File(databaseDir(), "nodeId.properties");
-            Properties props = new Properties();
-            if (file.canRead()) {
-                props.load(new FileReader(file));
-            } else {
-                ECKey key = new ECKey();
-                props.setProperty("nodeIdPrivateKey", Hex.toHexString(key.getPrivKeyBytes()));
-                props.setProperty("nodeId", Hex.toHexString(key.getNodeId()));
-                file.getParentFile().mkdirs();
-                props.store(new FileWriter(file), "Generated NodeID. To use your own nodeId please refer to 'peer.privateKey' config option.");
-                logger.info("New nodeID generated: " + props.getProperty("nodeId"));
-                logger.info("Generated nodeID and its private key stored in " + file);
+        if (generatedNodePrivateKey == null) {
+            try {
+                File file = new File(databaseDir(), "nodeId.properties");
+                Properties props = new Properties();
+                if (file.canRead()) {
+                    try (Reader r = new FileReader(file)) {
+                        props.load(r);
+                    }
+                } else {
+                    ECKey key = new ECKey();
+                    props.setProperty("nodeIdPrivateKey", Hex.toHexString(key.getPrivKeyBytes()));
+                    props.setProperty("nodeId", Hex.toHexString(key.getNodeId()));
+                    file.getParentFile().mkdirs();
+                    try (Writer w = new FileWriter(file)) {
+                        props.store(w, "Generated NodeID. To use your own nodeId please refer to 'peer.privateKey' config option.");
+                    }
+                    logger.info("New nodeID generated: " + props.getProperty("nodeId"));
+                    logger.info("Generated nodeID and its private key stored in " + file);
+                }
+                generatedNodePrivateKey = props.getProperty("nodeIdPrivateKey");
+            } catch (IOException e) {
+                throw new RuntimeException(e);
             }
-            return props.getProperty("nodeIdPrivateKey");
-        } catch (IOException e) {
-            throw new RuntimeException(e);
         }
+        return generatedNodePrivateKey;
     }
 
     @ValidateMe
