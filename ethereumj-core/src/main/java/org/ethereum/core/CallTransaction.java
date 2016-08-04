@@ -1,6 +1,8 @@
 package org.ethereum.core;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonGetter;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.ethereum.util.ByteUtil;
 import org.ethereum.util.FastByteComparisons;
@@ -18,7 +20,7 @@ import java.util.List;
 import static java.lang.String.format;
 import static org.apache.commons.lang3.ArrayUtils.subarray;
 import static org.apache.commons.lang3.StringUtils.stripEnd;
-import static org.ethereum.crypto.SHA3Helper.sha3;
+import static org.ethereum.crypto.HashUtil.sha3;
 import static org.ethereum.util.ByteUtil.longToBytesNoLeadZeroes;
 
 /**
@@ -38,13 +40,6 @@ public class CallTransaction {
                 longToBytesNoLeadZeroes(value),
                 data);
         return tx;
-    }
-
-    public static Transaction createCallTransaction(long nonce, long gasPrice, long gasLimit, String toAddress,
-                        long value, Function callFunc, Object ... funcArgs) {
-
-        byte[] callData = callFunc.encode(funcArgs);
-        return createRawTransaction(nonce, gasPrice, gasLimit, toAddress, value, callData);
     }
 
     /**
@@ -106,6 +101,13 @@ public class CallTransaction {
         }
     }
 
+    public static Transaction createCallTransaction(long nonce, long gasPrice, long gasLimit, String toAddress,
+                        long value, Function callFunc, Object ... funcArgs) {
+
+        byte[] callData = callFunc.encode(funcArgs);
+        return createRawTransaction(nonce, gasPrice, gasLimit, toAddress, value, callData);
+    }
+
     public static abstract class ArrayType extends Type {
         public static ArrayType getType(String typeName) {
             int idx1 = typeName.indexOf("[");
@@ -141,6 +143,10 @@ public class CallTransaction {
             } else {
                 throw new RuntimeException("List value expected for type " + getName());
             }
+        }
+
+        public Type getElementType() {
+            return elementType;
         }
 
         public abstract byte[] encodeList(List l);
@@ -426,10 +432,16 @@ public class CallTransaction {
         }
     }
 
+    @JsonInclude(JsonInclude.Include.NON_NULL)
     public static class Param {
-        public boolean indexed;
+        public Boolean indexed;
         public String name;
         public Type type;
+
+        @JsonGetter("type")
+        public String getType() {
+            return type.getName();
+        }
     }
 
     enum FunctionType {
