@@ -21,6 +21,9 @@ import static org.ethereum.util.ByteUtil.toHexString;
  */
 public class BlockHeader {
 
+    public static final int NONCE_LENGTH = 8;
+    public static final int HASH_LENGTH = 32;
+    public static final int ADDRESS_LENGTH = 20;
 
     /* The SHA3 256-bit hash of the parent block, in its entirety */
     private byte[] parentHash;
@@ -339,6 +342,7 @@ public class BlockHeader {
 
     private String toStringWithSuffix(final String suffix) {
         StringBuilder toStringBuff = new StringBuilder();
+        toStringBuff.append("  hash=").append(toHexString(getHash())).append(suffix);
         toStringBuff.append("  parentHash=").append(toHexString(parentHash)).append(suffix);
         toStringBuff.append("  unclesHash=").append(toHexString(unclesHash)).append(suffix);
         toStringBuff.append("  coinbase=").append(toHexString(coinbase)).append(suffix);

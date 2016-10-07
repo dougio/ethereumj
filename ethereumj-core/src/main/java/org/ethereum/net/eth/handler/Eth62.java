@@ -1,16 +1,22 @@
 package org.ethereum.net.eth.handler;
 
 import io.netty.channel.ChannelHandlerContext;
+import org.apache.commons.lang3.tuple.Pair;
+import org.ethereum.config.SystemProperties;
 import org.ethereum.core.*;
 import org.ethereum.db.BlockStore;
+import org.ethereum.listener.CompositeEthereumListener;
 import org.ethereum.net.eth.EthVersion;
 import org.ethereum.net.eth.message.*;
 import org.ethereum.net.message.ReasonCode;
 import org.ethereum.net.rlpx.discover.NodeManager;
+import org.ethereum.net.submit.TransactionExecutor;
+import org.ethereum.net.submit.TransactionTask;
 import org.ethereum.sync.SyncManager;
 import org.ethereum.sync.SyncState;
 import org.ethereum.sync.SyncStatistics;
 import org.ethereum.util.ByteUtil;
+import org.ethereum.util.FastByteComparisons;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.spongycastle.util.encoders.Hex;
@@ -19,12 +25,10 @@ import org.springframework.context.annotation.Scope;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Nullable;
-import javax.annotation.PostConstruct;
 import java.math.BigInteger;
 import java.util.*;
 import java.util.concurrent.LinkedBlockingQueue;
 
-import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.util.Collections.singletonList;
 import static org.ethereum.net.eth.EthVersion.V62;
@@ -66,18 +70,10 @@ public class Eth62 extends EthHandler {
     protected boolean syncDone = false;
 
     /**
-     * Last block hash to be asked from the peer,
-     * is set on header retrieving start
-     */
-    protected byte[] lastHashToAsk;
-
-    /**
      * Number and hash of best known remote block
      */
     protected BlockIdentifier bestKnownBlock;
     private BigInteger totalDifficulty;
-
-    protected boolean commonAncestorFound = true;
 
     /**
      * Header list sent in GET_BLOCK_BODIES message,
@@ -91,14 +87,16 @@ public class Eth62 extends EthHandler {
 
     protected Queue<GetBlockHeadersMessageWrapper> headerRequests = new LinkedBlockingQueue<>();
 
-    private BlockWrapper gapBlock;
+    private Map<Long, byte[]> blockHashCheck;
 
     public Eth62() {
         super(V62);
     }
 
-    @PostConstruct
-    private void init() {
+    @Autowired
+    public Eth62(final SystemProperties config, final Blockchain blockchain,
+                 final CompositeEthereumListener ethereumListener) {
+        super(V62, config, blockchain, ethereumListener);
         maxHashesAsk = config.maxHashesAsk();
     }
 
@@ -147,7 +145,8 @@ public class Eth62 extends EthHandler {
         int networkId = config.networkId();
 
         BigInteger totalDifficulty = blockchain.getTotalDifficulty();
-        byte[] bestHash = blockchain.getBestBlockHash();
+        // Getting it from blockstore, not blocked by blockchain sync
+        byte[] bestHash = blockstore.getBestBlock().getHash();
         StatusMessage msg = new StatusMessage(protocolVersion, networkId,
                 ByteUtil.bigIntegerToBytes(totalDifficulty), bestHash, config.getGenesis().getHash());
         sendMessage(msg);
@@ -248,8 +247,7 @@ public class Eth62 extends EthHandler {
 
         try {
 
-            if (!Arrays.equals(msg.getGenesisHash(), config.getGenesis().getHash())
-                    || msg.getProtocolVersion() != version.getCode()) {
+            if (!Arrays.equals(msg.getGenesisHash(), config.getGenesis().getHash())) {
                 if (!peerDiscoveryMode) {
                     loggerNet.info("Removing EthHandler for {} due to protocol incompatibility", ctx.channel().remoteAddress());
                 }
@@ -304,10 +302,23 @@ public class Eth62 extends EthHandler {
         if (!syncDone) return;
 
         if (syncState != HASH_RETRIEVING) {
-            BlockIdentifier first = identifiers.get(0);
-            long lastBlockNumber = identifiers.get(identifiers.size() - 1).getNumber();
-            int maxBlocksAsk = (int) (lastBlockNumber - first.getNumber() + 1);
-            sendGetNewBlockHeaders(first.getHash(), maxBlocksAsk, 0, false);
+            long firstBlockAsk = Long.MAX_VALUE;
+            long lastBlockAsk = 0;
+            byte[] firstBlockHash = null;
+            for (BlockIdentifier identifier : identifiers) {
+                long blockNumber = identifier.getNumber();
+                if (blockNumber < firstBlockAsk) {
+                    firstBlockAsk = blockNumber;
+                    firstBlockHash = identifier.getHash();
+                }
+                if (blockNumber > lastBlockAsk)  {
+                    lastBlockAsk = blockNumber;
+                }
+            }
+            long maxBlocksAsk = lastBlockAsk - firstBlockAsk + 1;
+            if (firstBlockHash != null && maxBlocksAsk > 0 && maxBlocksAsk < MAX_HASHES_TO_SEND) {
+                sendGetNewBlockHeaders(firstBlockHash, (int) maxBlocksAsk, 0, false);
+            }
         }
     }
 
@@ -317,7 +328,11 @@ public class Eth62 extends EthHandler {
         }
 
         List<Transaction> txSet = msg.getTransactions();
-        pendingState.addPendingTransactions(txSet);
+        List<Transaction> newPending = pendingState.addPendingTransactions(txSet);
+        if (!newPending.isEmpty()) {
+            TransactionTask transactionTask = new TransactionTask(newPending, channel.getChannelManager(), channel);
+            TransactionExecutor.instance.submitTransaction(transactionTask);
+        }
     }
 
     protected synchronized void processGetBlockHeaders(GetBlockHeadersMessage msg) {
@@ -350,7 +365,7 @@ public class Eth62 extends EthHandler {
 
         List<BlockHeader> received = msg.getBlockHeaders();
 
-        if (ethState == EthState.STATUS_SENT)
+        if (ethState == EthState.STATUS_SENT || ethState == EthState.HASH_CONSTRAINTS_CHECK)
             processInitHeaders(received);
         else {
             syncStats.addHeaders(received.size());
@@ -450,13 +465,51 @@ public class Eth62 extends EthHandler {
     }
 
     protected synchronized void processInitHeaders(List<BlockHeader> received) {
+
         BlockHeader first = received.get(0);
-        updateBestBlock(first);
-        ethState = EthState.STATUS_SUCCEEDED;
-        logger.trace(
-                "Peer {}: init request succeeded, best known block {}",
-                channel.getPeerIdShort(), bestKnownBlock
-        );
+        if (ethState == EthState.STATUS_SENT) {
+            updateBestBlock(first);
+
+            logger.trace("Peer {}: init request succeeded, best known block {}",
+                    channel.getPeerIdShort(), bestKnownBlock);
+
+            // checking if the peer has expected block hashes
+            ethState = EthState.HASH_CONSTRAINTS_CHECK;
+
+            List<Pair<Long, byte[]>> constraints = config.getBlockchainConfig().
+                    getConfigForBlock(first.getNumber()).blockHashConstraints();
+
+            blockHashCheck = Collections.synchronizedMap(new HashMap<Long, byte[]>());
+            for (Pair<Long, byte[]> constraint : constraints) {
+                if (constraint.getLeft() <= getBestKnownBlock().getNumber()) {
+                    blockHashCheck.put(constraint.getLeft(), constraint.getRight());
+                    sendGetBlockHeaders(constraint.getLeft(), 1, false);
+                }
+            }
+
+            logger.trace("Peer " + channel.getPeerIdShort() + ": Requested " + blockHashCheck.size() +
+                    " headers for hash check: " + blockHashCheck.keySet());
+
+        } else {
+            byte[] expectedHash = blockHashCheck.get(first.getNumber());
+            if (expectedHash != null) {
+                if (FastByteComparisons.equal(expectedHash, first.getHash())) {
+                    blockHashCheck.remove(first.getNumber());
+                } else {
+                    logger.debug("Peer " + channel.getPeerIdShort() + ": wrong fork (expected block " +
+                            first.getNumber() + " hash " + Hex.toHexString(expectedHash) + ", but got " +
+                            Hex.toHexString(first.getHash()) + ". Drop the peer and reduce reputation.");
+                    channel.getNodeStatistics().wrongFork = true;
+                    dropConnection();
+                }
+            }
+        }
+
+        if (blockHashCheck.isEmpty()) {
+            ethState = EthState.STATUS_SUCCEEDED;
+
+            logger.trace("Peer {}: all validations passed", channel.getPeerIdShort());
+        }
     }
 
     private void updateBestBlock(Block block) {
@@ -508,7 +561,7 @@ public class Eth62 extends EthHandler {
 
     @Override
     public boolean hasStatusPassed() {
-        return ethState.ordinal() > EthState.STATUS_SENT.ordinal();
+        return ethState.ordinal() > EthState.HASH_CONSTRAINTS_CHECK.ordinal();
     }
 
     @Override
@@ -607,7 +660,7 @@ public class Eth62 extends EthHandler {
         return response.getBlockBodies().size() <= sentHeaders.size();
     }
 
-    private boolean isValid(BlockHeadersMessage response, GetBlockHeadersMessageWrapper requestWrapper) {
+    protected boolean isValid(BlockHeadersMessage response, GetBlockHeadersMessageWrapper requestWrapper) {
 
         GetBlockHeadersMessage request = requestWrapper.getMessage();
         List<BlockHeader> headers = response.getBlockHeaders();
@@ -626,7 +679,7 @@ public class Eth62 extends EthHandler {
         if (headers.isEmpty()) {
 
             // initial call after handshake
-            if (ethState == EthState.STATUS_SENT) {
+            if (ethState == EthState.STATUS_SENT || ethState == EthState.HASH_CONSTRAINTS_CHECK) {
                 if (logger.isInfoEnabled()) logger.info(
                         "Peer {}: invalid response to initial {}, empty",
                         channel.getPeerIdShort(), request
@@ -651,22 +704,16 @@ public class Eth62 extends EthHandler {
         BlockHeader first = headers.get(0);
 
         if (request.getBlockHash() != null) {
+            if (!Arrays.equals(request.getBlockHash(), first.getHash())) {
 
-            if (request.getSkipBlocks() == 0) {
-                if (!Arrays.equals(request.getBlockHash(), first.getHash())) {
-
-                    if (logger.isInfoEnabled()) logger.info(
-                            "Peer {}: invalid response to {}, first header is invalid {}",
-                            channel.getPeerIdShort(), request, first
-                    );
-                    return false;
-                }
+                if (logger.isInfoEnabled()) logger.info(
+                        "Peer {}: invalid response to {}, first header is invalid {}",
+                        channel.getPeerIdShort(), request, first
+                );
+                return false;
             }
-
         } else {
-
-            long expectedNum = request.getBlockNumber() + request.getSkipBlocks();
-            if (expectedNum != first.getNumber()) {
+            if (request.getBlockNumber() != first.getNumber()) {
 
                 if (logger.isInfoEnabled()) logger.info(
                         "Peer {}: invalid response to {}, first header is invalid {}",
@@ -680,56 +727,40 @@ public class Eth62 extends EthHandler {
         if (requestWrapper.isNewHashesHandling()) return true;
 
         // numbers and ancestors
-        if (request.isReverse()) {
+        int offset = 1 + request.getSkipBlocks();
+        if (request.isReverse()) offset = -offset;
 
-            for (int i = 1; i < headers.size(); i++) {
+        for (int i = 1; i < headers.size(); i++) {
 
-                BlockHeader cur = headers.get(i);
-                BlockHeader prev = headers.get(i - 1);
+            BlockHeader cur = headers.get(i);
+            BlockHeader prev = headers.get(i - 1);
 
-                long num = cur.getNumber();
-                long expectedNum = prev.getNumber() - 1;
+            long num = cur.getNumber();
+            long expectedNum = prev.getNumber() + offset;
 
-                if (num != expectedNum) {
-                    if (logger.isInfoEnabled()) logger.info(
-                            "Peer {}: invalid response to {}, got #{}, expected #{}",
-                            channel.getPeerIdShort(), request, num, expectedNum
-                    );
-                    return false;
-                }
-
-                if (!Arrays.equals(prev.getParentHash(), cur.getHash())) {
-                    if (logger.isInfoEnabled()) logger.info(
-                            "Peer {}: invalid response to {}, got parent hash {} for #{}, expected {}",
-                            channel.getPeerIdShort(), request, toHexString(prev.getParentHash()),
-                            prev.getNumber(), toHexString(cur.getHash())
-                            );
-                    return false;
-                }
+            if (num != expectedNum) {
+                if (logger.isInfoEnabled()) logger.info(
+                        "Peer {}: invalid response to {}, got #{}, expected #{}",
+                        channel.getPeerIdShort(), request, num, expectedNum
+                );
+                return false;
             }
-        } else {
 
-            for (int i = 1; i < headers.size(); i++) {
-
-                BlockHeader cur = headers.get(i);
-                BlockHeader prev = headers.get(i - 1);
-
-                long num = cur.getNumber();
-                long expectedNum = prev.getNumber() + 1;
-
-                if (num != expectedNum) {
-                    if (logger.isInfoEnabled()) logger.info(
-                            "Peer {}: invalid response to {}, got #{}, expected #{}",
-                            channel.getPeerIdShort(), request, num, expectedNum
-                    );
-                    return false;
+            if (request.getSkipBlocks() == 0) {
+                BlockHeader parent;
+                BlockHeader child;
+                if (request.isReverse()) {
+                    parent = cur;
+                    child = prev;
+                } else {
+                    parent = prev;
+                    child = cur;
                 }
-
-                if (!Arrays.equals(cur.getParentHash(), prev.getHash())) {
+                if (!Arrays.equals(child.getParentHash(), parent.getHash())) {
                     if (logger.isInfoEnabled()) logger.info(
                             "Peer {}: invalid response to {}, got parent hash {} for #{}, expected {}",
-                            channel.getPeerIdShort(), request, toHexString(cur.getParentHash()),
-                            cur.getNumber(), toHexString(prev.getHash())
+                            channel.getPeerIdShort(), request, toHexString(child.getParentHash()),
+                            prev.getNumber(), toHexString(parent.getHash())
                     );
                     return false;
                 }
@@ -756,18 +787,20 @@ public class Eth62 extends EthHandler {
     public String getSyncStats() {
 
         return String.format(
-                "Peer %s: [ %s, %16s, ping %6s ms, difficulty %s, best block %s ]",
+                "Peer %s: [ %s, %16s, ping %6s ms, difficulty %s, best block %s ]: %s",
                 version,
                 channel.getPeerIdShort(),
                 syncState,
                 (int)channel.getPeerStats().getAvgLatency(),
                 getTotalDifficulty(),
-                getBestKnownBlock().getNumber());
+                getBestKnownBlock().getNumber(),
+                channel.getNodeStatistics().getClientId());
     }
 
     protected enum EthState {
         INIT,
         STATUS_SENT,
+        HASH_CONSTRAINTS_CHECK,
         STATUS_SUCCEEDED,
         STATUS_FAILED
     }

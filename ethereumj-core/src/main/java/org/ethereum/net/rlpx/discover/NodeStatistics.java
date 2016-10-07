@@ -1,5 +1,6 @@
 package org.ethereum.net.rlpx.discover;
 
+import org.ethereum.net.client.Capability;
 import org.ethereum.net.eth.message.StatusMessage;
 import org.ethereum.net.message.ReasonCode;
 import org.ethereum.net.rlpx.Node;
@@ -12,6 +13,8 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.io.Serializable;
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -82,8 +85,13 @@ public class NodeStatistics {
     public final StatHandler rlpxHandshake = new StatHandler();
     public final StatHandler rlpxOutMessages = new StatHandler();
     public final StatHandler rlpxInMessages = new StatHandler();
+    // Not the fork we are working on
+    // Set only after specific block hashes received
+    public boolean wrongFork;
 
     private String clientId = "";
+
+    public final List<Capability> capabilities = new ArrayList<>();
 
     private ReasonCode rlpxLastRemoteDisconnectReason = null;
     private ReasonCode rlpxLastLocalDisconnectReason = null;
@@ -101,10 +109,10 @@ public class NodeStatistics {
         discoverMessageLatency = (Statter.SimpleStatter) Statter.create(getStatName() + ".discoverMessageLatency");
     }
 
-    int getSessionReputation() {
+    private int getSessionReputation() {
         return getSessionFairReputation() + (isPredefined ? REPUTATION_PREDEFINED : 0);
     }
-    int getSessionFairReputation() {
+    private int getSessionFairReputation() {
         int discoverReput = 0;
 
         discoverReput += min(discoverInPong.get(), 10) * (discoverOutPing.get() == discoverInPong.get() ? 2 : 1);
@@ -124,10 +132,10 @@ public class NodeStatistics {
                 // the disconnect was not initiated by discover mode
                 if (rlpxLastRemoteDisconnectReason == ReasonCode.TOO_MANY_PEERS) {
                     // The peer is popular, but we were unlucky
-                    rlpxReput *= 0.8;
-                } else {
+                    rlpxReput *= 0.3;
+                } else if (rlpxLastRemoteDisconnectReason != ReasonCode.REQUESTED) {
                     // other disconnect reasons
-                    rlpxReput *= 0.5;
+                    rlpxReput *= 0.2;
                 }
             }
         }
@@ -136,7 +144,18 @@ public class NodeStatistics {
     }
 
     public int getReputation() {
-        return savedReputation / 2 + getSessionReputation();
+        return isReputationPenalized() ? 0 : savedReputation / 2 + getSessionReputation();
+    }
+
+    private boolean isReputationPenalized() {
+        boolean penalizeReputation = false;
+        if (wrongFork) penalizeReputation = true;
+        if (rlpxLastLocalDisconnectReason != null) {
+            if (rlpxLastLocalDisconnectReason == ReasonCode.NULL_IDENTITY) penalizeReputation = true;
+            if (rlpxLastLocalDisconnectReason == ReasonCode.INCOMPATIBLE_PROTOCOL) penalizeReputation = true;
+        }
+
+        return penalizeReputation;
     }
 
     public void nodeDisconnectedRemote(ReasonCode reason) {
@@ -170,6 +189,10 @@ public class NodeStatistics {
         this.clientId = clientId;
     }
 
+    public String getClientId() {
+        return clientId;
+    }
+
     public void setPredefined(boolean isPredefined) {
         this.isPredefined = isPredefined;
     }
@@ -188,7 +211,7 @@ public class NodeStatistics {
 
     Persistent getPersistent() {
         Persistent persistent = new Persistent();
-        persistent.reputation = (getSessionFairReputation() + savedReputation) / 2;
+        persistent.reputation = isReputationPenalized() ? 0 : (savedReputation + getSessionFairReputation()) / 2;
         return persistent;
     }
 

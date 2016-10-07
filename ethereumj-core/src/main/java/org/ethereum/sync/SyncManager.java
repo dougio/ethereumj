@@ -4,8 +4,6 @@ import org.ethereum.config.SystemProperties;
 import org.ethereum.core.*;
 import org.ethereum.listener.CompositeEthereumListener;
 import org.ethereum.listener.EthereumListener;
-import org.ethereum.manager.WorldManager;
-import org.ethereum.net.eth.handler.Eth62;
 import org.ethereum.net.server.Channel;
 import org.ethereum.net.server.ChannelManager;
 import org.ethereum.util.ExecutorPipeline;
@@ -17,7 +15,6 @@ import org.spongycastle.util.encoders.Hex;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -81,19 +78,13 @@ public class SyncManager {
     private CompositeEthereumListener compositeEthereumListener;
 
     @Autowired
-    SyncPool pool;
-
-    @Autowired
-    WorldManager worldManager;
-
-    @Autowired
-    SystemProperties config;
-
-    @Autowired
     EthereumListener ethereumListener;
 
-    @Autowired
     ChannelManager channelManager;
+
+    private SystemProperties config;
+
+    private SyncPool pool;
 
     private SyncQueueIfc syncQueue;
 
@@ -105,59 +96,58 @@ public class SyncManager {
     private Thread getBodiesThread;
     private ScheduledExecutorService logExecutor = Executors.newSingleThreadScheduledExecutor();
 
-    @PostConstruct
-    public void init() {
+    public SyncManager() {
+    }
 
-        // make it asynchronously
-        new Thread(new Runnable() {
+    @Autowired
+    public SyncManager(final SystemProperties config) {
+        this.config = config;
+    }
+
+    public void init(final ChannelManager channelManager, final SyncPool pool) {
+        this.pool = pool;
+        this.channelManager = channelManager;
+        if (!config.isSyncEnabled()) {
+            logger.info("Sync Manager: OFF");
+            return;
+        }
+        logger.info("Sync Manager: ON");
+
+        logger.info("Initializing SyncManager.");
+        pool.init(channelManager);
+
+        Runnable queueProducer = new Runnable(){
+
             @Override
             public void run() {
-
-                if (!config.isSyncEnabled()) {
-                    logger.info("Sync Manager: OFF");
-                    return;
-                }
-
-                logger.info("Sync Manager: ON");
-
-                worldManager.waitForInit();
-                logger.info("Initializing SyncManager.");
-
-                Runnable queueProducer = new Runnable(){
-
-                    @Override
-                    public void run() {
-                        produceQueue();
-                    }
-                };
-
-                syncQueueThread =new Thread (queueProducer, "SyncQueueThread");
-                syncQueueThread.start();
-
-                syncQueue = new SyncQueueImpl(blockchain);
-
-                getHeadersThread = new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        headerRetrieveLoop();
-                    }
-                }, "NewSyncThreadHeaders");
-                getHeadersThread.start();
-
-                getBodiesThread = new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        blockRetrieveLoop();
-                    }
-                }, "NewSyncThreadBlocks");
-                getBodiesThread.start();
-
-                if (logger.isInfoEnabled()) {
-                    startLogWorker();
-                }
-
+                produceQueue();
             }
-        }).start();
+        };
+
+        syncQueueThread = new Thread (queueProducer, "SyncQueueThread");
+        syncQueueThread.start();
+
+        syncQueue = new SyncQueueImpl(blockchain);
+
+        getHeadersThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                headerRetrieveLoop();
+            }
+        }, "NewSyncThreadHeaders");
+        getHeadersThread.start();
+
+        getBodiesThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                blockRetrieveLoop();
+            }
+        }, "NewSyncThreadBlocks");
+        getBodiesThread.start();
+
+        if (logger.isInfoEnabled()) {
+            startLogWorker();
+        }
     }
 
     private void headerRetrieveLoop() {
@@ -200,7 +190,7 @@ public class SyncManager {
                         // to get more chances to receive block body promptly
                         for (BlockHeaderWrapper blockHeaderWrapper : bReq.getBlockHeaders()) {
                             Channel channel = pool.getByNodeId(blockHeaderWrapper.getNodeId());
-                            if (channel != null) {
+                            if (channel != null && channel.isIdle()) {
                                 channel.getEthHandler().sendGetBlockBodies(singletonList(blockHeaderWrapper));
                             }
                         }
@@ -267,6 +257,8 @@ public class SyncManager {
 
                 if (syncDone && (importResult == IMPORTED_BEST || importResult == IMPORTED_NOT_BEST)) {
                     if (logger.isDebugEnabled()) logger.debug("Block dump: " + Hex.toHexString(wrapper.getBlock().getEncoded()));
+                    // Propagate block to the net after successful import asynchronously
+                    if (wrapper.isNewBlock()) channelManager.onNewForeignBlock(wrapper);
                 }
 
                 // In case we don't have a parent on the chain
@@ -279,10 +271,13 @@ public class SyncManager {
             } catch (InterruptedException e) {
                 break;
             } catch (Throwable e) {
-                logger.error("Error processing block {}: ", wrapper.getBlock().getShortDescr(), e);
-                logger.error("Block dump: {}", Hex.toHexString(wrapper.getBlock().getEncoded()));
+                if (wrapper != null) {
+                    logger.error("Error processing block {}: ", wrapper.getBlock().getShortDescr(), e);
+                    logger.error("Block dump: {}", Hex.toHexString(wrapper.getBlock().getEncoded()));
+                } else {
+                    logger.error("Error processing unknown block", e);
+                }
             }
-
         }
     }
 

@@ -455,7 +455,6 @@ public class Program {
 
         track.commit();
         getResult().addDeleteAccounts(result.getDeleteAccounts());
-        getResult().addLogInfos(result.getLogInfoList());
 
         // IN SUCCESS PUSH THE ADDRESS INTO THE STACK
         stackPush(new DataWord(newAddress));
@@ -552,6 +551,8 @@ public class Program {
 
                 internalTx.reject();
                 result.rejectInternalTransactions();
+                // In this case we should reject LogInfo's too
+                result.rejectLogInfos();
 
                 track.rollback();
                 stackPushZero();

@@ -114,13 +114,10 @@ public class PendingStateLongRunTest {
                 .withParentBlockHeaderValidator(new CommonConfig().parentHeaderValidator());
         blockchain.setParentHeaderValidator(new DependentBlockHeaderRuleAdapter());
         blockchain.setProgramInvokeFactory(programInvokeFactory);
-        programInvokeFactory.setBlockchain(blockchain);
 
         blockchain.byTest = true;
 
         PendingStateImpl pendingState = new PendingStateImpl(new EthereumListenerAdapter(), blockchain);
-
-        pendingState.init();
 
         pendingState.setBlockchain(blockchain);
         blockchain.setPendingState(pendingState);

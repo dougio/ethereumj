@@ -14,11 +14,12 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 
 import static java.lang.Math.min;
 
@@ -44,16 +45,9 @@ public class NodeManager implements Functional.Consumer<DiscoveryEvent>{
     static final int MAX_NODES = 2000;
     static final int NODES_TRIM_THRESHOLD = 3000;
 
-    @Autowired
     PeerConnectionTester peerConnectionManager;
-
-    @Autowired
     MapDBFactory mapDBFactory;
-
-    @Autowired
     EthereumListener ethereumListener;
-
-    @Autowired
     SystemProperties config = SystemProperties.getDefault();
 
     Functional.Consumer<DiscoveryEvent> messageSender;
@@ -76,18 +70,15 @@ public class NodeManager implements Functional.Consumer<DiscoveryEvent>{
     private boolean inited = false;
     private Timer logStatsTimer = new Timer();
     private Timer nodeManagerTasksTimer = new Timer("NodeManagerTasks");;
+    private ScheduledExecutorService pongTimer;
 
-    public NodeManager() {
-    }
+    @Autowired
+    public NodeManager(SystemProperties config, EthereumListener ethereumListener, MapDBFactory mapDBFactory, PeerConnectionTester peerConnectionManager) {
+        this.config = config;
+        this.ethereumListener = ethereumListener;
+        this.mapDBFactory = mapDBFactory;
+        this.peerConnectionManager = peerConnectionManager;
 
-//    public NodeManager(NodeTable table, ECKey key) {
-//        this.table = table;
-//        homeNode = table.getNode();
-//        this.key = key;
-//    }
-
-    @PostConstruct
-    void init() {
         PERSIST = config.peerDiscoveryPersist();
         discoveryEnabled = config.peerDiscovery();
 
@@ -102,9 +93,14 @@ public class NodeManager implements Functional.Consumer<DiscoveryEvent>{
             }
         }, 1 * 1000, 60 * 1000);
 
+        this.pongTimer = Executors.newSingleThreadScheduledExecutor();
         for (Node node : config.peerActive()) {
             getNodeHandler(node).getNodeStatistics().setPredefined(true);
         }
+    }
+
+    public ScheduledExecutorService getPongTimer() {
+        return pongTimer;
     }
 
     void setBootNodes(List<Node> bootNodes) {
@@ -289,7 +285,7 @@ public class NodeManager implements Functional.Consumer<DiscoveryEvent>{
     }
 
     public void stateChanged(NodeHandler nodeHandler, NodeHandler.State oldState, NodeHandler.State newState) {
-        if (discoveryEnabled) {
+        if (discoveryEnabled && peerConnectionManager != null) {  // peerConnectionManager can be null if component not inited yet
             peerConnectionManager.nodeStatusChanged(nodeHandler);
         }
     }
@@ -421,6 +417,12 @@ public class NodeManager implements Functional.Consumer<DiscoveryEvent>{
             nodeManagerTasksTimer.cancel();
         } catch (Exception e) {
             logger.warn("Problems canceling nodeManagerTasksTimer", e);
+        }
+        try {
+            logger.info("Cancelling pongTimer");
+            pongTimer.shutdownNow();
+        } catch (Exception e) {
+            logger.warn("Problems cancelling pongTimer", e);
         }
         try {
             logStatsTimer.cancel();

@@ -2,10 +2,7 @@ package org.ethereum.trie;
 
 import org.ethereum.datasource.KeyValueDataSource;
 import org.ethereum.db.ByteArrayWrapper;
-import org.ethereum.util.RLP;
-import org.ethereum.util.RLPItem;
-import org.ethereum.util.RLPList;
-import org.ethereum.util.Value;
+import org.ethereum.util.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.spongycastle.util.encoders.Hex;
@@ -26,9 +23,7 @@ import static org.ethereum.crypto.HashUtil.EMPTY_TRIE_HASH;
 import static org.ethereum.util.ByteUtil.EMPTY_BYTE_ARRAY;
 import static org.ethereum.util.ByteUtil.matchingNibbleLength;
 import static org.ethereum.util.ByteUtil.wrap;
-import static org.ethereum.util.CompactEncoder.binToNibbles;
-import static org.ethereum.util.CompactEncoder.packNibbles;
-import static org.ethereum.util.CompactEncoder.unpackToNibbles;
+import static org.ethereum.util.CompactEncoder.*;
 import static org.ethereum.util.RLP.calcElementPrefixSize;
 import static org.spongycastle.util.Arrays.concatenate;
 
@@ -49,6 +44,14 @@ import static org.spongycastle.util.Arrays.concatenate;
  *
  * <b>Note:</b> the data isn't persisted unless `sync` is explicitly called.
  *
+ * This Trie implementation supports node pruning (i.e. obsolete nodes are marked
+ * for removal in the Cache and actually removed from the underlying storage
+ * on [sync] call), but the algorithm is not suitable for the most general case.
+ * In general case a trie node might be referenced from several parent nodes
+ * and for correct pruning the reference counting algorithm needs to be implemented.
+ * As soon as the real life tree keys are hashes it is very unlikely the case so
+ * the pruning algorithm is simplified in this implementation.
+ *
  * @author Nick Savers
  * @since 20.05.2014
  */
@@ -62,6 +65,7 @@ public class TrieImpl implements Trie {
     private Object prevRoot;
     private Object root;
     private Cache cache;
+    private boolean pruningEnabled;
 
     public TrieImpl(KeyValueDataSource db) {
         this(db, "");
@@ -99,13 +103,24 @@ public class TrieImpl implements Trie {
     }
 
     public void deserializeRoot(byte[] data){
-        try {
-            ByteArrayInputStream b = new ByteArrayInputStream(data);
-            ObjectInputStream o = new ObjectInputStream(b);
-            root = o.readObject();
-        } catch (IOException | ClassNotFoundException e) {
-            e.printStackTrace();
+        synchronized (cache) {
+            try {
+                ByteArrayInputStream b = new ByteArrayInputStream(data);
+                ObjectInputStream o = new ObjectInputStream(b);
+                root = o.readObject();
+            } catch (IOException | ClassNotFoundException e) {
+                e.printStackTrace();
+            }
         }
+    }
+
+    public boolean isPruningEnabled() {
+        return pruningEnabled;
+    }
+
+    public TrieImpl withPruningEnabled(boolean pruningEnabled) {
+        this.pruningEnabled = pruningEnabled;
+        return this;
     }
 
     /**************************************
@@ -121,12 +136,14 @@ public class TrieImpl implements Trie {
 
     @Override
     public byte[] get(byte[] key) {
-        if (logger.isDebugEnabled())
-            logger.debug("Retrieving key {}", Hex.toHexString(key));
-        byte[] k = binToNibbles(key);
-        Value c = new Value(this.get(this.root, k));
+        synchronized (cache) {
+            if (logger.isDebugEnabled())
+                logger.debug("Retrieving key {}", Hex.toHexString(key));
+            byte[] k = binToNibbles(key);
+            Value c = new Value(this.get(this.root, k));
 
-        return c.asBytes();
+            return c.asBytes();
+        }
     }
 
     /**
@@ -140,12 +157,17 @@ public class TrieImpl implements Trie {
     public void update(byte[] key, byte[] value) {
         if (key == null)
             throw new NullPointerException("Key should not be blank");
-        byte[] k = binToNibbles(key);
+        synchronized (cache) {
+            byte[] k = binToNibbles(key);
 
-        this.root = this.insertOrDelete(this.root, k, value);
-        if (logger.isDebugEnabled()) {
-            logger.debug("Added key {} and value {}", Hex.toHexString(key), Hex.toHexString(value));
-            logger.debug("New root-hash: {}", Hex.toHexString(this.getRootHash()));
+            if (isEmptyNode(root)) {
+                cache.markRemoved(getRootHash());
+            }
+            this.root = this.insertOrDelete(this.root, k, value);
+            if (logger.isDebugEnabled()) {
+                logger.debug("Added key {} and value {}", Hex.toHexString(key), Hex.toHexString(value));
+                logger.debug("New root-hash: {}", Hex.toHexString(this.getRootHash()));
+            }
         }
     }
 
@@ -158,24 +180,28 @@ public class TrieImpl implements Trie {
 
     @Override
     public void delete(byte[] key) {
-        this.update(key, EMPTY_BYTE_ARRAY);
-        if (logger.isDebugEnabled()) {
-            logger.debug("Deleted value for key {}", Hex.toHexString(key));
-            logger.debug("New root-hash: {}", Hex.toHexString(this.getRootHash()));
+        synchronized (cache) {
+            this.update(key, EMPTY_BYTE_ARRAY);
+            if (logger.isDebugEnabled()) {
+                logger.debug("Deleted value for key {}", Hex.toHexString(key));
+                logger.debug("New root-hash: {}", Hex.toHexString(this.getRootHash()));
+            }
         }
     }
 
     @Override
     public byte[] getRootHash() {
-        if (root == null
-                || (root instanceof byte[] && ((byte[]) root).length == 0)
-                || (root instanceof String && "".equals(root))) {
-            return EMPTY_TRIE_HASH;
-        } else if (root instanceof byte[]) {
-            return (byte[]) this.getRoot();
-        } else {
-            Value rootValue = new Value(this.getRoot());
-            return rootValue.hash();
+        synchronized (cache) {
+            if (root == null
+                    || (root instanceof byte[] && ((byte[]) root).length == 0)
+                    || (root instanceof String && "".equals(root))) {
+                return EMPTY_TRIE_HASH;
+            } else if (root instanceof byte[]) {
+                return (byte[]) this.getRoot();
+            } else {
+                Value rootValue = new Value(this.getRoot());
+                return rootValue.hash();
+            }
         }
     }
 
@@ -184,27 +210,29 @@ public class TrieImpl implements Trie {
      ****************************************/
 
     private Object get(Object node, byte[] key) {
+        synchronized (cache) {
 
-        // Return the node if key is empty (= found)
-        if (key.length == 0 || isEmptyNode(node)) {
-            return node;
-        }
-
-        Value currentNode = this.getNode(node);
-        if (currentNode == null) return null;
-
-        if (currentNode.length() == PAIR_SIZE) {
-            // Decode the key
-            byte[] k = unpackToNibbles(currentNode.get(0).asBytes());
-            Object v = currentNode.get(1).asObj();
-
-            if (key.length >= k.length && Arrays.equals(k, copyOfRange(key, 0, k.length))) {
-                return this.get(v, copyOfRange(key, k.length, key.length));
-            } else {
-                return "";
+            // Return the node if key is empty (= found)
+            if (key.length == 0 || isEmptyNode(node)) {
+                return node;
             }
-        } else {
-            return this.get(currentNode.get(key[0]).asObj(), copyOfRange(key, 1, key.length));
+
+            Value currentNode = this.getNode(node);
+            if (currentNode == null) return null;
+
+            if (currentNode.length() == PAIR_SIZE) {
+                // Decode the key
+                byte[] k = unpackToNibbles(currentNode.get(0).asBytes());
+                Object v = currentNode.get(1).asObj();
+
+                if (key.length >= k.length && Arrays.equals(k, copyOfRange(key, 0, k.length))) {
+                    return this.get(v, copyOfRange(key, k.length, key.length));
+                } else {
+                    return "";
+                }
+            } else {
+                return this.get(currentNode.get(key[0]).asObj(), copyOfRange(key, 1, key.length));
+            }
         }
     }
 
@@ -232,6 +260,10 @@ public class TrieImpl implements Trie {
         }
 
         Value currentNode = this.getNode(node);
+
+        if (currentNode == null) {
+            throw new RuntimeException("Invalid Trie state, missing node " + new Value(node));
+        }
 
         // Check for "special" 2 slice type node
         if (currentNode.length() == PAIR_SIZE) {
@@ -268,6 +300,8 @@ public class TrieImpl implements Trie {
                 newHash = this.putToCache(scaledSlice);
             }
 
+            markRemoved(currentNode.hash());
+
             if (matchingLength == 0) {
                 // End of the chain, return
                 return newHash;
@@ -282,6 +316,14 @@ public class TrieImpl implements Trie {
 
             // Replace the first nibble in the key
             newNode[key[0]] = this.insert(currentNode.get(key[0]).asObj(), copyOfRange(key, 1, key.length), value);
+
+            if (!FastByteComparisons.equal(getNode(newNode).hash(), currentNode.hash())) {
+                markRemoved(currentNode.hash());
+                if (!isEmptyNode(currentNode.get(key[0]))) {
+                    markRemoved(currentNode.get(key[0]).asBytes());
+                }
+            }
+
             return this.putToCache(newNode);
         }
     }
@@ -294,6 +336,10 @@ public class TrieImpl implements Trie {
 
         // New node
         Value currentNode = this.getNode(node);
+        if (currentNode == null) {
+            throw new RuntimeException("Invalid Trie state, missing node " + new Value(node));
+        }
+
         // Check for "special" 2 slice type node
         if (currentNode.length() == PAIR_SIZE) {
             // Decode the key
@@ -314,6 +360,7 @@ public class TrieImpl implements Trie {
                 } else {
                     newNode = new Object[]{currentNode.get(0), hash};
                 }
+                markRemoved(currentNode.hash());
                 return this.putToCache(newNode);
             } else {
                 return node;
@@ -350,7 +397,19 @@ public class TrieImpl implements Trie {
             } else {
                 newNode = itemList;
             }
+
+
+            if (!FastByteComparisons.equal(getNode(newNode).hash(), currentNode.hash())) {
+                markRemoved(currentNode.hash());
+            }
+
             return this.putToCache(newNode);
+        }
+    }
+
+    private void markRemoved(byte[] hash) {
+        if (pruningEnabled) {
+            cache.markRemoved(hash);
         }
     }
 
@@ -405,24 +464,30 @@ public class TrieImpl implements Trie {
 
     @Override
     public void sync() {
-        this.cache.commit();
-        this.prevRoot = this.root;
+        synchronized (cache) {
+            this.cache.commit();
+            this.prevRoot = this.root;
+        }
     }
 
     @Override
     public void undo() {
-        this.cache.undo();
-        this.root = this.prevRoot;
+        synchronized (cache) {
+            this.cache.undo();
+            this.root = this.prevRoot;
+        }
     }
 
     // Returns a copy of this trie
     public TrieImpl copy() {
-        TrieImpl trie = new TrieImpl(this.cache.getDb(), this.root);
-        for (ByteArrayWrapper key : this.cache.getNodes().keySet()) {
-            Node node = this.cache.getNodes().get(key);
-            trie.cache.getNodes().put(key, node.copy());
+        synchronized (cache) {
+            TrieImpl trie = new TrieImpl(this.cache.getDb(), this.root);
+            for (ByteArrayWrapper key : this.cache.getNodes().keySet()) {
+                Node node = this.cache.getNodes().get(key);
+                trie.cache.getNodes().put(key, node.copy());
+            }
+            return trie;
         }
-        return trie;
     }
 
     /********************************
@@ -446,29 +511,31 @@ public class TrieImpl implements Trie {
      * cleaning process.
      */
     public void cleanCache() {
+        synchronized (cache) {
 
-        CollectFullSetOfNodes collectAction = new CollectFullSetOfNodes();
-        long startTime = System.currentTimeMillis();
+            CollectFullSetOfNodes collectAction = new CollectFullSetOfNodes();
+            long startTime = System.currentTimeMillis();
 
-        this.scanTree(this.getRootHash(), collectAction);
+            this.scanTree(this.getRootHash(), collectAction);
 
-        Set<ByteArrayWrapper> hashSet = collectAction.getCollectedHashes();
-        Map<ByteArrayWrapper, Node> nodes = this.getCache().getNodes();
-        Set<ByteArrayWrapper> toRemoveSet = new HashSet<>();
+            Set<ByteArrayWrapper> hashSet = collectAction.getCollectedHashes();
+            Map<ByteArrayWrapper, Node> nodes = this.getCache().getNodes();
+            Set<ByteArrayWrapper> toRemoveSet = new HashSet<>();
 
-        for (ByteArrayWrapper key : nodes.keySet())
-            if (!hashSet.contains(key.getData()))
-                toRemoveSet.add(key);
+            for (ByteArrayWrapper key : nodes.keySet())
+                if (!hashSet.contains(key.getData()))
+                    toRemoveSet.add(key);
 
-        for (ByteArrayWrapper key : toRemoveSet) {
-            this.getCache().delete(key.getData());
+            for (ByteArrayWrapper key : toRemoveSet) {
+                this.getCache().delete(key.getData());
 
-            if (logger.isTraceEnabled())
-                logger.trace("Garbage collected node: [{}]",
-                        Hex.toHexString(key.getData()));
+                if (logger.isTraceEnabled())
+                    logger.trace("Garbage collected node: [{}]",
+                            Hex.toHexString(key.getData()));
+            }
+            logger.info("Garbage collected node list, size: [{}]", toRemoveSet.size());
+            logger.info("Garbage collection time: [{}ms]", System.currentTimeMillis() - startTime);
         }
-        logger.info("Garbage collected node list, size: [{}]", toRemoveSet.size());
-        logger.info("Garbage collection time: [{}ms]", System.currentTimeMillis() - startTime);
     }
 
     public void printFootPrint() {
@@ -476,134 +543,153 @@ public class TrieImpl implements Trie {
         this.getCache().getNodes();
     }
 
-    private void scanTree(byte[] hash, ScanAction scanAction) {
+    public void scanTree(byte[] hash, ScanAction scanAction) {
+        synchronized (cache) {
 
-        Value node = this.getCache().get(hash);
-        if (node == null) return;
-
-        if (node.isList()) {
-            List<Object> siblings = node.asList();
-            if (siblings.size() == PAIR_SIZE) {
-                Value val = new Value(siblings.get(1));
-                if (val.isHashCode())
-                    scanTree(val.asBytes(), scanAction);
-            } else {
-                for (int j = 0; j < LIST_SIZE; ++j) {
-                    Value val = new Value(siblings.get(j));
-                    if (val.isHashCode())
-                        scanTree(val.asBytes(), scanAction);
-                }
+            Value node = this.getCache().get(hash);
+            if (node == null) {
+                throw new RuntimeException("Not found: " + Hex.toHexString(hash));
             }
-            scanAction.doOnNode(hash, node);
+
+            if (node.isList()) {
+                List<Object> siblings = node.asList();
+                if (siblings.size() == PAIR_SIZE) {
+                    Value val = new Value(siblings.get(1));
+                    if (val.isHashCode() && !hasTerminator((byte[]) siblings.get(0)))
+                        scanTree(val.asBytes(), scanAction);
+                } else {
+                    for (int j = 0; j < LIST_SIZE; ++j) {
+                        Value val = new Value(siblings.get(j));
+                        if (val.isHashCode())
+                            scanTree(val.asBytes(), scanAction);
+                    }
+                }
+                scanAction.doOnNode(hash, node);
+            }
         }
     }
 
     public void deserialize(byte[] data){
-        RLPList rlpList = (RLPList) RLP.decode2(data).get(0);
+        synchronized (cache) {
+            RLPList rlpList = (RLPList) RLP.decode2(data).get(0);
 
-        RLPItem keysElement = (RLPItem)rlpList.get(0);
-        RLPList valsList    = (RLPList)rlpList.get(1);
-        RLPItem root        = (RLPItem)rlpList.get(2);
+            RLPItem keysElement = (RLPItem) rlpList.get(0);
+            RLPList valsList = (RLPList) rlpList.get(1);
+            RLPItem root = (RLPItem) rlpList.get(2);
 
-        for (int i = 0; i < valsList.size(); ++i){
+            for (int i = 0; i < valsList.size(); ++i) {
 
-            byte[] val = valsList.get(i).getRLPData();
-            byte[] key = new byte[32];
+                byte[] val = valsList.get(i).getRLPData();
+                byte[] key = new byte[32];
 
-            Value value = Value.fromRlpEncoded(val);
-            System.arraycopy(keysElement.getRLPData(), i * 32, key, 0, 32);
-            cache.getNodes().put(wrap(key), new Node(value));
+                Value value = Value.fromRlpEncoded(val);
+                System.arraycopy(keysElement.getRLPData(), i * 32, key, 0, 32);
+                cache.getNodes().put(wrap(key), new Node(value));
+            }
+
+            this.deserializeRoot(root.getRLPData());
         }
-
-        this.deserializeRoot(root.getRLPData());
     }
 
     public byte[] serialize(){
 
-        Map<ByteArrayWrapper, Node> map = getCache().getNodes();
+        synchronized (cache) {
+            Map<ByteArrayWrapper, Node> map = getCache().getNodes();
 
-        int keysTotalSize = 0;
-        int valsTotalSize = 0;
+            int keysTotalSize = 0;
+            int valsTotalSize = 0;
 
-        Set<ByteArrayWrapper> keys = map.keySet();
-        for (ByteArrayWrapper key : keys){
+            Set<ByteArrayWrapper> keys = map.keySet();
+            for (ByteArrayWrapper key : keys) {
+                Node node = map.get(key);
+                if (node == null) continue;
 
-            byte[] keyBytes =  key.getData();
-            keysTotalSize += keyBytes.length;
+                byte[] keyBytes = key.getData();
+                keysTotalSize += keyBytes.length;
 
-            byte[] valBytes = map.get(key).getValue().getData();
-            valsTotalSize += valBytes.length + calcElementPrefixSize(valBytes);
+                byte[] valBytes = node.getValue().getData();
+                valsTotalSize += valBytes.length + calcElementPrefixSize(valBytes);
+            }
+
+            byte[] root = null;
+            try {
+                ByteArrayOutputStream b = new ByteArrayOutputStream();
+                ObjectOutputStream o = new ObjectOutputStream(b);
+                o.writeObject(this.getRoot());
+                root = b.toByteArray();
+                root = RLP.encodeElement(root);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
+            byte[] keysHeader = RLP.encodeLongElementHeader(keysTotalSize);
+            byte[] valsHeader = RLP.encodeListHeader(valsTotalSize);
+            byte[] listHeader = RLP.encodeListHeader(keysTotalSize + keysHeader.length +
+                    valsTotalSize + valsHeader.length + root.length);
+
+            byte[] rlpData = new byte[keysTotalSize + keysHeader.length +
+                    valsTotalSize + valsHeader.length + listHeader.length + root.length];
+
+            // copy headers:
+            //      [ rlp_list_header, rlp_keys_header, rlp_keys, rlp_vals_header, rlp_val]
+
+            System.arraycopy(listHeader, 0, rlpData, 0, listHeader.length);
+            System.arraycopy(keysHeader, 0, rlpData, listHeader.length, keysHeader.length);
+            System.arraycopy(valsHeader,
+                    0,
+                    rlpData,
+                    (listHeader.length + keysHeader.length + keysTotalSize),
+                    valsHeader.length);
+            System.arraycopy(root,
+                    0,
+                    rlpData,
+                    (listHeader.length + keysHeader.length + keysTotalSize + valsTotalSize + valsHeader.length),
+                    root.length);
+
+
+            int k_1 = 0;
+            int k_2 = 0;
+            for (ByteArrayWrapper key : keys) {
+                Node node = map.get(key);
+                if (node == null) continue;
+
+                System.arraycopy(key.getData(), 0, rlpData,
+                        (listHeader.length + keysHeader.length + k_1),
+                        key.getData().length);
+
+                k_1 += key.getData().length;
+
+                byte[] valBytes = RLP.encodeElement(node.getValue().getData());
+
+                System.arraycopy(valBytes, 0, rlpData,
+                        listHeader.length + keysHeader.length + keysTotalSize + valsHeader.length + k_2,
+                        valBytes.length);
+                k_2 += valBytes.length;
+            }
+
+            return rlpData;
         }
-
-        byte[] root = null;
-        try {
-            ByteArrayOutputStream b = new ByteArrayOutputStream();
-            ObjectOutputStream o = new ObjectOutputStream(b);
-            o.writeObject(this.getRoot());
-            root = b.toByteArray();
-            root = RLP.encodeElement(root);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-
-        byte[] keysHeader = RLP.encodeLongElementHeader(keysTotalSize);
-        byte[] valsHeader = RLP.encodeListHeader(valsTotalSize);
-        byte[] listHeader = RLP.encodeListHeader(keysTotalSize + keysHeader.length +
-                valsTotalSize + valsHeader.length + root.length);
-
-        byte[] rlpData = new byte[keysTotalSize + keysHeader.length +
-                valsTotalSize + valsHeader.length + listHeader.length + root.length];
-
-        // copy headers:
-        //      [ rlp_list_header, rlp_keys_header, rlp_keys, rlp_vals_header, rlp_val]
-
-        System.arraycopy(listHeader, 0, rlpData, 0, listHeader.length);
-        System.arraycopy(keysHeader, 0, rlpData, listHeader.length, keysHeader.length);
-        System.arraycopy(valsHeader,
-                0,
-                rlpData,
-                (listHeader.length + keysHeader.length + keysTotalSize),
-                valsHeader.length);
-        System.arraycopy(root,
-                0,
-                rlpData,
-                (listHeader.length + keysHeader.length + keysTotalSize + valsTotalSize+ valsHeader.length),
-                root.length);
-
-
-        int k_1 = 0;
-        int k_2 = 0;
-        for (ByteArrayWrapper key : keys){
-
-            System.arraycopy(key.getData(), 0, rlpData,
-                    (listHeader.length + keysHeader.length + k_1),
-                    key.getData().length);
-
-            k_1 += key.getData().length;
-
-            byte[] valBytes =  RLP.encodeElement( map.get(key).getValue().getData() );
-
-            System.arraycopy(valBytes, 0, rlpData,
-                    listHeader.length + keysHeader.length + keysTotalSize + valsHeader.length + k_2,
-                    valBytes.length);
-            k_2 += valBytes.length;
-        }
-
-        return rlpData;
     }
 
     public String getTrieDump() {
 
-        TraceAllNodes traceAction = new TraceAllNodes();
-        this.scanTree(this.getRootHash(), traceAction);
+        synchronized (cache) {
+            TraceAllNodes traceAction = new TraceAllNodes();
+            Value value = new Value(root);
+            if (value.isHashCode()) {
+                this.scanTree(this.getRootHash(), traceAction);
+            } else {
+                traceAction.doOnNode(this.getRootHash(), value);
+            }
 
-        final String root;
-        if (this.getRoot() instanceof Value) {
-            root = "root: " + Hex.toHexString(getRootHash()) + " => " + this.getRoot() + "\n";
-        } else {
-            root = "root: " + Hex.toHexString(getRootHash()) + "\n";
+            final String root;
+            if (this.getRoot() instanceof Value) {
+                root = "root: " + Hex.toHexString(getRootHash()) + " => " + this.getRoot() + "\n";
+            } else {
+                root = "root: " + Hex.toHexString(getRootHash()) + "\n";
+            }
+            return root + traceAction.getOutput();
         }
-        return root + traceAction.getOutput();
     }
 
     public interface ScanAction {
@@ -611,8 +697,22 @@ public class TrieImpl implements Trie {
     }
 
     public boolean validate() {
-        return cache.get(getRootHash()) != null;
+        synchronized (cache) {
+            logger.info("Validating state trie...");
+            final int[] cnt = new int[1];
+            try {
+                scanTree(getRootHash(), new TrieImpl.ScanAction() {
+                    @Override
+                    public void doOnNode(byte[] hash, Value node) {
+                        cnt[0]++;
+                    }
+                });
+            } catch (Exception e) {
+                logger.error("Bad trie", e);
+                return false;
+            }
+            logger.info("Done. Nodes: " + cnt[0]);
+            return true;
+        }
     }
-
-
 }

@@ -114,6 +114,7 @@ public class SystemProperties {
     private Boolean databaseReset = null;
     private String projectVersion = null;
     private String projectVersionModifier = null;
+    protected Integer databaseVersion = null;
 
     private String genesisInfo = null;
 
@@ -192,6 +193,7 @@ public class SystemProperties {
 
             this.projectVersionModifier = "master".equals(BuildInfo.buildBranch) ? "RELEASE" : "SNAPSHOT";
 
+            this.databaseVersion = Integer.valueOf(props.getProperty("databaseVersion"));
         } catch (Exception e) {
             logger.error("Can't read config.", e);
             throw new RuntimeException(e);
@@ -369,6 +371,11 @@ public class SystemProperties {
     }
 
     @ValidateMe
+    public int databasePruneDepth() {
+        return config.getBoolean("database.prune.enabled") ? config.getInt("database.prune.maxDepth") : -1;
+    }
+
+    @ValidateMe
     public List<Node> peerActive() {
         if (!config.hasPath("peer.active")) {
             return Collections.EMPTY_LIST;
@@ -528,6 +535,11 @@ public class SystemProperties {
     }
 
     @ValidateMe
+    public Integer databaseVersion() {
+        return databaseVersion;
+    }
+
+    @ValidateMe
     public String projectVersionModifier() {
         return projectVersionModifier;
     }
@@ -582,7 +594,10 @@ public class SystemProperties {
         return config.getString("vm.structured.dir");
     }
 
-    @ValidateMe
+    public String customSolcPath() {
+        return config.hasPath("solc.path") ? config.getString("solc.path"): null;
+    }
+
     public String privateKey() {
         if (config.hasPath("peer.privateKey")) {
             String key = config.getString("peer.privateKey");
@@ -623,7 +638,6 @@ public class SystemProperties {
         return generatedNodePrivateKey;
     }
 
-    @ValidateMe
     public ECKey getMyKey() {
         return ECKey.fromPrivate(Hex.decode(privateKey()));
     }
@@ -631,7 +645,6 @@ public class SystemProperties {
     /**
      *  Home NodeID calculated from 'peer.privateKey' property
      */
-    @ValidateMe
     public byte[] nodeId() {
         return getMyKey().getNodeId();
     }
@@ -735,11 +748,7 @@ public class SystemProperties {
 
     @ValidateMe
     public String genesisInfo() {
-
-        if (genesisInfo == null)
-            return config.getString("genesis");
-        else
-            return genesisInfo;
+        return genesisInfo == null ? config.getString("genesis") : genesisInfo;
     }
 
     @ValidateMe

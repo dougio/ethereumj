@@ -6,8 +6,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.spongycastle.util.encoders.Hex;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Scope;
-import org.springframework.stereotype.Component;
 
 import java.io.File;
 import java.io.IOException;
@@ -20,7 +18,6 @@ import java.util.Set;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import static java.lang.System.getProperty;
 import static org.fusesource.leveldbjni.JniDBFactory.factory;
 
 /**
@@ -76,11 +73,20 @@ public class LevelDbDataSource implements KeyValueDataSource {
 
             try {
                 logger.debug("Opening database");
-                Path dbPath = Paths.get(config.databaseDir(), name);
-                Files.createDirectories(dbPath.getParent());
+                final Path dbPath = Paths.get(config.databaseDir(), name);
+                if (!Files.isSymbolicLink(dbPath.getParent())) Files.createDirectories(dbPath.getParent());
 
                 logger.debug("Initializing new or existing database: '{}'", name);
-                db = factory.open(dbPath.toFile(), options);
+                try {
+                    db = factory.open(dbPath.toFile(), options);
+                } catch (IOException e) {
+                    // database must be corrupted
+                    logger.warn("Problem initializing database.", e);
+                    logger.info("LevelDB database must be corrupted. Trying to repair. Could take some time.");
+                    factory.repair(dbPath.toFile(), options);
+                    logger.info("Repair finished. Opening database again.");
+                    db = factory.open(dbPath.toFile(), options);
+                }
 
                 alive = true;
             } catch (IOException ioe) {

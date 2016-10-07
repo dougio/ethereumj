@@ -6,9 +6,7 @@ import org.ethereum.util.Value;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static java.lang.String.format;
@@ -25,11 +23,18 @@ public class Cache {
     private static final Logger logger = LoggerFactory.getLogger("general");
 
     private KeyValueDataSource dataSource;
-    private Map<ByteArrayWrapper, Node> nodes = new ConcurrentHashMap<>();
+    private Map<ByteArrayWrapper, Node> nodes = new HashMap<>();
+    private Set<ByteArrayWrapper> removedNodes = new HashSet<>();
     private boolean isDirty;
     
     public Cache(KeyValueDataSource dataSource) {
         this.dataSource = dataSource;
+    }
+
+    public synchronized void markRemoved(byte[] key) {
+        ByteArrayWrapper keyW = new ByteArrayWrapper(key);
+        removedNodes.add(keyW);
+        nodes.remove(keyW);
     }
 
     /**
@@ -38,12 +43,14 @@ public class Cache {
      * @param o the Node which could be a pair-, multi-item Node or single Value
      * @return keccak hash of RLP encoded node if length &gt; 32 otherwise return node itself
      */
-    public Object put(Object o) {
+    public synchronized Object put(Object o) {
         Value value = new Value(o);
         byte[] enc = value.encode();
         if (enc.length >= 32) {
             byte[] sha = value.hash();
-            this.nodes.put(wrap(sha), new Node(value, true));
+            ByteArrayWrapper key = wrap(sha);
+            this.nodes.put(key, new Node(value, true));
+            this.removedNodes.remove(key);
             this.isDirty = true;
 
             return sha;
@@ -51,7 +58,7 @@ public class Cache {
         return value;
     }
 
-    public Value get(byte[] key) {
+    public synchronized Value get(byte[] key) {
         ByteArrayWrapper wrappedKey = wrap(key);
         // First check if the key is the cache
         Node node = this.nodes.get(wrappedKey);
@@ -65,7 +72,7 @@ public class Cache {
         return node.getValue();
     }
 
-    public void delete(byte[] key) {
+    public synchronized void delete(byte[] key) {
         ByteArrayWrapper wrappedKey = wrap(key);
         this.nodes.remove(wrappedKey);
 
@@ -74,7 +81,7 @@ public class Cache {
         }
     }
 
-    public void commit() {
+    public synchronized void commit() {
         // Don't try to commit if it isn't dirty
         if ((dataSource == null) || !this.isDirty) return;
 
@@ -85,29 +92,33 @@ public class Cache {
         for (ByteArrayWrapper nodeKey : this.nodes.keySet()) {
             Node node = this.nodes.get(nodeKey);
 
-            if (node.isDirty()) {
-                node.setDirty(false);
+            if (node == null || node.isDirty()) {
+                byte[] value;
+                if (node != null) {
+                    node.setDirty(false);
+                    value = node.getValue().encode();
+                } else {
+                    value = null;
+                }
 
-                byte[] value = node.getValue().encode();
                 byte[] key = nodeKey.getData();
 
                 batch.put(key, value);
                 batchMemorySize += length(key, value);
             }
         }
+        for (ByteArrayWrapper removedNode : removedNodes) {
+            batch.put(removedNode.getData(), null);
+        }
 
         this.dataSource.updateBatch(batch);
         this.isDirty = false;
         this.nodes.clear();
+        this.removedNodes.clear();
 
-        long finish = System.nanoTime();
-
-        float flushSize = (float) batchMemorySize / 1048576;
-        float flushTime = (float) (finish - start) / 1_000_000;
-        logger.info(format("Flush '%s' in: %02.2f ms, %d nodes, %02.2fMB", dataSource.getName(), flushTime, batch.size(), flushSize));
     }
 
-    public void undo() {
+    public synchronized void undo() {
         Iterator<Map.Entry<ByteArrayWrapper, Node>> iter = this.nodes.entrySet().iterator();
         while (iter.hasNext()) {
             if (iter.next().getValue().isDirty()) {
@@ -117,19 +128,19 @@ public class Cache {
         this.isDirty = false;
     }
 
-    public boolean isDirty() {
+    public synchronized boolean isDirty() {
         return isDirty;
     }
 
-    public void setDirty(boolean isDirty) {
+    public synchronized void setDirty(boolean isDirty) {
         this.isDirty = isDirty;
     }
 
-    public Map<ByteArrayWrapper, Node> getNodes() {
+    public synchronized Map<ByteArrayWrapper, Node> getNodes() {
         return nodes;
     }
 
-    public KeyValueDataSource getDb() {
+    public synchronized KeyValueDataSource getDb() {
         return dataSource;
     }
 
@@ -144,14 +155,16 @@ public class Cache {
         return cacheDump.toString();
     }
 
-    public void setDB(KeyValueDataSource dataSource) {
+    public synchronized void setDB(KeyValueDataSource dataSource) {
         if (this.dataSource == dataSource) return;
 
         Map<byte[], byte[]> rows = new HashMap<>();
         if (this.dataSource == null) {
             for (ByteArrayWrapper key : nodes.keySet()) {
                 Node node = nodes.get(key);
-                if (!node.isDirty()) {
+                if (node == null) {
+                    rows.put(key.getData(), null);
+                }else if (!node.isDirty()) {
                     rows.put(key.getData(), node.getValue().encode());
                 }
             }

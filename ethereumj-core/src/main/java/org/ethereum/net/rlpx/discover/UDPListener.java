@@ -12,7 +12,6 @@ import org.spongycastle.util.encoders.Hex;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.net.BindException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,16 +38,11 @@ public class UDPListener {
     private volatile boolean shutdown = false;
     private DiscoveryExecutor discoveryExecutor;
 
-    public UDPListener() {
-    }
+    @Autowired
+    public UDPListener(final SystemProperties config, final NodeManager nodeManager) {
+        this.config = config;
+        this.nodeManager = nodeManager;
 
-    public UDPListener(String address, int port) {
-        this.address = address;
-        this.port = port;
-    }
-
-    @PostConstruct
-    void init() {
         this.address = config.bindIp();
         port = config.listenPort();
         if (config.peerDiscovery()) {
@@ -71,6 +65,11 @@ public class UDPListener {
                 }.start();
             }
         }
+    }
+
+    public UDPListener(String address, int port) {
+        this.address = address;
+        this.port = port;
     }
 
     public static Node parseNode(String s) {

@@ -1,14 +1,14 @@
 package org.ethereum.net.rlpx.discover;
 
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.commons.codec.binary.Hex;
 import org.ethereum.config.SystemProperties;
-import org.ethereum.manager.WorldManager;
+import org.ethereum.net.client.PeerClient;
 import org.ethereum.net.rlpx.Node;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.math.BigInteger;
 import java.util.*;
 import java.util.concurrent.*;
@@ -27,10 +27,9 @@ public class PeerConnectionTester {
     private long ReconnectMaxPeers;
 
     @Autowired
-    private WorldManager worldManager;
+    private PeerClient peerClient;
 
-    @Autowired
-    SystemProperties config = SystemProperties.getDefault();
+    private SystemProperties config = SystemProperties.getDefault();
 
     // NodeHandler instance should be unique per Node instance
     private Map<NodeHandler, ?> connectedCandidates = Collections.synchronizedMap(new IdentityHashMap());
@@ -55,7 +54,7 @@ public class PeerConnectionTester {
                     nodeHandler.getNodeStatistics().rlpxConnectionAttempts.add();
                     logger.debug("Trying node connection: " + nodeHandler);
                     Node node = nodeHandler.getNode();
-                    worldManager.getActivePeer().connect(node.getHost(), node.getPort(),
+                    peerClient.connect(node.getHost(), node.getPort(),
                             Hex.encodeHexString(node.getId()), true);
                     logger.debug("Terminated node connection: " + nodeHandler);
                     nodeHandler.getNodeStatistics().disconnected();
@@ -81,11 +80,9 @@ public class PeerConnectionTester {
         }
     }
 
-    public PeerConnectionTester() {
-    }
-
-    @PostConstruct
-    void init() {
+    @Autowired
+    public PeerConnectionTester(final SystemProperties config) {
+        this.config = config;
         ConnectThreads = config.peerDiscoveryWorkers();
         ReconnectPeriod = config.peerDiscoveryTouchPeriod() * 1000;
         ReconnectMaxPeers = config.peerDiscoveryTouchMaxNodes();
@@ -97,7 +94,7 @@ public class PeerConnectionTester {
                         return h2.nodeHandler.getNodeStatistics().getReputation() -
                                 h1.nodeHandler.getNodeStatistics().getReputation();
                     }
-                }));
+                }), new ThreadFactoryBuilder().setDaemon(true).setNameFormat("discovery-tester-%d").build());
     }
 
     public void close() {

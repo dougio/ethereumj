@@ -18,7 +18,6 @@ import org.spongycastle.util.encoders.Hex;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.util.*;
 
 import static org.ethereum.listener.EthereumListener.PendingTransactionState.*;
@@ -61,9 +60,6 @@ public class PendingStateImpl implements PendingState {
     private EthereumListener listener;
 
     @Autowired
-    private Repository repository;
-
-    @Autowired
     private Blockchain blockchain;
 
     @Autowired
@@ -75,21 +71,26 @@ public class PendingStateImpl implements PendingState {
     @Autowired
     private ProgramInvokeFactory programInvokeFactory;
 
+    private Repository repository;
+
     private final List<PendingTransaction> pendingTransactions = new ArrayList<>();
 
     // to filter out the transactions we have already processed
     // transactions could be sent by peers even if they were already included into blocks
-    private final Map<ByteArrayWrapper, Object> redceivedTxs = new LRUMap<>(100000);
+    private final Map<ByteArrayWrapper, Object> receivedTxs = new LRUMap<>(100000);
     private final Object dummyObject = new Object();
 
     private Repository pendingState;
 
     private Block best = null;
 
-    public PendingStateImpl() {
+    @Autowired
+    public PendingStateImpl(Repository repository) {
+        this.repository = repository;
+        init();
     }
 
-    public PendingStateImpl(EthereumListener listener, BlockchainImpl blockchain) {
+    public PendingStateImpl(final EthereumListener listener, final BlockchainImpl blockchain) {
         this.listener = listener;
         this.blockchain = blockchain;
         this.repository = blockchain.getRepository();
@@ -98,7 +99,6 @@ public class PendingStateImpl implements PendingState {
         this.transactionStore = blockchain.getTransactionStore();
     }
 
-    @PostConstruct
     public void init() {
         this.pendingState = repository.startTracking();
     }
@@ -128,7 +128,7 @@ public class PendingStateImpl implements PendingState {
     }
 
     private boolean addNewTxIfNotExist(Transaction tx) {
-        return redceivedTxs.put(new ByteArrayWrapper(tx.getHash()), dummyObject) == null;
+        return receivedTxs.put(new ByteArrayWrapper(tx.getHash()), dummyObject) == null;
     }
 
     @Override
@@ -137,7 +137,7 @@ public class PendingStateImpl implements PendingState {
     }
 
     @Override
-    public synchronized void addPendingTransactions(List<Transaction> transactions) {
+    public synchronized List<Transaction> addPendingTransactions(List<Transaction> transactions) {
         int unknownTx = 0;
         List<Transaction> newPending = new ArrayList<>();
         for (Transaction tx : transactions) {
@@ -150,12 +150,30 @@ public class PendingStateImpl implements PendingState {
         }
 
         logger.debug("Wire transaction list added: total: {}, new: {}, valid (added to pending): {} (current #of known txs: {})",
-                transactions.size(), unknownTx, newPending, redceivedTxs.size());
+                transactions.size(), unknownTx, newPending, receivedTxs.size());
 
         if (!newPending.isEmpty()) {
             listener.onPendingTransactionsReceived(newPending);
             listener.onPendingStateChanged(PendingStateImpl.this);
         }
+
+        return newPending;
+    }
+
+    public synchronized void trackTransaction(Transaction tx) {
+        List<TransactionInfo> infos = transactionStore.get(tx.getHash());
+        if (!infos.isEmpty()) {
+            for (TransactionInfo info : infos) {
+                Block txBlock = blockStore.getBlockByHash(info.getBlockHash());
+                if (txBlock.isEqual(blockStore.getChainBlockByNumber(txBlock.getNumber()))) {
+                    // transaction included to the block on main chain
+                    info.getReceipt().setTransaction(tx);
+                    fireTxUpdate(info.getReceipt(), INCLUDED, txBlock);
+                    return;
+                }
+            }
+        }
+        addPendingTransaction(tx);
     }
 
     private void fireTxUpdate(TransactionReceipt txReceipt, PendingTransactionState state, Block block) {
@@ -169,6 +187,12 @@ public class PendingStateImpl implements PendingState {
         listener.onPendingTransactionUpdate(txReceipt, state, block);
     }
 
+    /**
+     * Executes pending tx on the latest best block
+     * Fires pending state update
+     * @param tx    Transaction
+     * @return True if transaction gets NEW_PENDING state, False if DROPPED
+     */
     private boolean addPendingTransactionImpl(final Transaction tx) {
         TransactionReceipt newReceipt = new TransactionReceipt();
         newReceipt.setTransaction(tx);
@@ -357,7 +381,7 @@ public class PendingStateImpl implements PendingState {
 
         TransactionExecutor executor = commonConfig.transactionExecutor(
                 tx, best.getCoinbase(), pendingState,
-                blockStore, programInvokeFactory, best, new EthereumListenerAdapter(), 0);
+                blockStore, programInvokeFactory, createFakePendingBlock(), new EthereumListenerAdapter(), 0);
 
         executor.init();
         executor.execute();
@@ -365,6 +389,28 @@ public class PendingStateImpl implements PendingState {
         executor.finalization();
 
         return executor.getReceipt();
+    }
+
+    private Block createFakePendingBlock() {
+        // creating fake lightweight calculated block with no hashes calculations
+        Block block = new Block(best.getHash(),
+                BlockchainImpl.EMPTY_LIST_HASH, // uncleHash
+                new byte[32],
+                new byte[32], // log bloom - from tx receipts
+                new byte[0], // difficulty computed right after block creation
+                best.getNumber() + 1,
+                ByteUtil.longToBytesNoLeadZeroes(Long.MAX_VALUE), // max Gas Limit
+                0,  // gas used
+                best.getTimestamp() + 1,  // block time
+                new byte[0],  // extra data
+                new byte[0],  // mixHash (to mine)
+                new byte[0],  // nonce   (to mine)
+                new byte[32],  // receiptsRoot
+                new byte[32],    // TransactionsRoot
+                new byte[32], // stateRoot
+                Collections.<Transaction>emptyList(), // tx list
+                Collections.<BlockHeader>emptyList());  // uncle list
+        return block;
     }
 
     public void setBlockchain(Blockchain blockchain) {
